@@ -3,11 +3,11 @@ package db
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/mem"
 )
 
 type RedisChecker struct {
@@ -30,6 +30,26 @@ type RedisConfig struct {
 	Heartbeat        time.Duration
 	Ctx              context.Context
 	MonitorResources bool // Flag for resource monitoring
+}
+
+type RedisStats struct {
+	ConnectedClients      int64
+	UsedMemory            int64
+	UsedMemoryHuman       string
+	TotalKeys             int64
+	TotalConnections      int64
+	OpsPerSecond          int64
+	KeyspaceHits          int64
+	KeyspaceMisses        int64
+	KeyspaceHitRatio      float64
+	UptimeInSeconds       int64
+	RejectedConnections   int64
+	ReplBacklogSize       int64
+	UsedCpuSys            float64
+	UsedCpuUser           float64
+	MaxMemory             int64
+	MaxMemoryHuman        string
+	MemFragmentationRatio float64
 }
 
 func NewRedisChecker(cfg RedisConfig) *RedisChecker {
@@ -143,20 +163,150 @@ func (r *RedisChecker) checkRedisResourceUsage() (string, error) {
 		return "", nil
 	}
 
-	cpuUsage, err := cpu.Percent(0, false)
+	// Get Redis stats
+	stats, err := r.getRedisStats()
 	if err != nil {
-		return "", fmt.Errorf("error getting CPU usage: %v", err)
+		return "", fmt.Errorf("error getting Redis stats: %v", err)
 	}
 
-	memUsage, err := mem.VirtualMemory()
-	if err != nil {
-		return "", fmt.Errorf("error getting memory usage: %v", err)
+	// Format stats as a string
+	statsInfo := fmt.Sprintf("Redis Stats: Clients: %d, Memory: %s, Keys: %d, "+
+		"Ops/sec: %d, Hit ratio: %.2f%%, Uptime: %d sec, CPU (sys/user): %.2f/%.2f",
+		stats.ConnectedClients, stats.UsedMemoryHuman, stats.TotalKeys,
+		stats.OpsPerSecond, stats.KeyspaceHitRatio, stats.UptimeInSeconds,
+		stats.UsedCpuSys, stats.UsedCpuUser)
+
+	// Add memory details if max memory is set
+	if stats.MaxMemory > 0 {
+		memPercent := float64(stats.UsedMemory) / float64(stats.MaxMemory) * 100
+		statsInfo += fmt.Sprintf(", Mem usage: %.2f%% of %s", memPercent, stats.MaxMemoryHuman)
 	}
 
-	resourceInfo := fmt.Sprintf("CPU Usage: %.2f%%, Memory Usage: %.2f%%, Total Memory: %.2f GB",
-		cpuUsage[0], memUsage.UsedPercent, float64(memUsage.Total)/1024/1024/1024)
+	// Add fragmentation details
+	if stats.MemFragmentationRatio > 0 {
+		statsInfo += fmt.Sprintf(", Frag ratio: %.2f", stats.MemFragmentationRatio)
+	}
 
-	return resourceInfo, nil
+	return statsInfo, nil
+}
+
+// getRedisStats fetches statistics from the Redis server using INFO command
+func (r *RedisChecker) getRedisStats() (RedisStats, error) {
+	var stats RedisStats
+
+	// Check context before executing query
+	if r.ctx.Err() != nil {
+		return stats, r.ctx.Err()
+	}
+
+	// Get Redis INFO
+	info, err := r.client.Info(r.ctx).Result()
+	if err != nil {
+		return stats, fmt.Errorf("failed to get Redis INFO: %v", err)
+	}
+
+	// Parse the INFO output
+	sections := strings.Split(info, "\r\n")
+	infoMap := make(map[string]string)
+
+	for _, line := range sections {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			infoMap[parts[0]] = parts[1]
+		}
+	}
+
+	// Extract the statistics we want
+	if val, ok := infoMap["connected_clients"]; ok {
+		stats.ConnectedClients, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	if val, ok := infoMap["used_memory"]; ok {
+		stats.UsedMemory, _ = strconv.ParseInt(val, 10, 64)
+		stats.UsedMemoryHuman = formatBytes(stats.UsedMemory)
+	}
+
+	if val, ok := infoMap["total_connections_received"]; ok {
+		stats.TotalConnections, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	if val, ok := infoMap["instantaneous_ops_per_sec"]; ok {
+		stats.OpsPerSecond, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	if val, ok := infoMap["keyspace_hits"]; ok {
+		stats.KeyspaceHits, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	if val, ok := infoMap["keyspace_misses"]; ok {
+		stats.KeyspaceMisses, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	// Calculate hit ratio if we have both hits and misses
+	totalLookups := stats.KeyspaceHits + stats.KeyspaceMisses
+	if totalLookups > 0 {
+		stats.KeyspaceHitRatio = float64(stats.KeyspaceHits) / float64(totalLookups) * 100
+	}
+
+	if val, ok := infoMap["uptime_in_seconds"]; ok {
+		stats.UptimeInSeconds, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	if val, ok := infoMap["rejected_connections"]; ok {
+		stats.RejectedConnections, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	if val, ok := infoMap["used_cpu_sys"]; ok {
+		stats.UsedCpuSys, _ = strconv.ParseFloat(val, 64)
+	}
+
+	if val, ok := infoMap["used_cpu_user"]; ok {
+		stats.UsedCpuUser, _ = strconv.ParseFloat(val, 64)
+	}
+
+	if val, ok := infoMap["maxmemory"]; ok {
+		stats.MaxMemory, _ = strconv.ParseInt(val, 10, 64)
+		stats.MaxMemoryHuman = formatBytes(stats.MaxMemory)
+	}
+
+	if val, ok := infoMap["mem_fragmentation_ratio"]; ok {
+		stats.MemFragmentationRatio, _ = strconv.ParseFloat(val, 64)
+	}
+
+	// Count total keys by iterating over keyspace info
+	stats.TotalKeys = 0
+	for key, val := range infoMap {
+		if strings.HasPrefix(key, "db") { // db0, db1, etc.
+			parts := strings.Split(val, ",")
+			for _, part := range parts {
+				if strings.HasPrefix(part, "keys=") {
+					keyCount, _ := strconv.ParseInt(strings.TrimPrefix(part, "keys="), 10, 64)
+					stats.TotalKeys += keyCount
+				}
+			}
+		}
+	}
+
+	return stats, nil
+}
+
+// formatBytes converts bytes to human-readable format
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 func (r *RedisChecker) GetClient() *redis.Client {
@@ -181,9 +331,13 @@ func (r *RedisChecker) StartMonitoring() {
 			case <-r.ctx.Done():
 				// Reset the context if it’s canceled or expired
 				r.resetContext()
-				// Restart the ticker for the new context
-				ticker = time.NewTicker(r.heartbeat)
+
 			case <-ticker.C:
+				// Check if context is expired before using it
+				if r.ctx.Err() != nil {
+					r.resetContext()
+				}
+
 				status, detail := r.Check()
 				fmt.Printf("[Redis] Status: %v, Detail: %v\n", status, detail)
 				if r.monitorResources {
@@ -206,25 +360,7 @@ func (r *RedisChecker) resetContext() {
 		r.cancel()
 	}
 
-	// Create a new context with a timeout or custom duration
-	var baseCtx context.Context
-	var baseCancel context.CancelFunc
-
-	if r.ctx == nil {
-		baseCtx, baseCancel = context.WithTimeout(context.Background(), 15*time.Second)
-	} else {
-		baseCtx = r.ctx
-	}
-
-	r.ctx, r.cancel = context.WithCancel(baseCtx)
-
-	// Clean up the base context after setting up (so timeout doesn't run forever)
-	if baseCancel != nil {
-		go func() {
-			<-r.ctx.Done()
-			baseCancel()
-		}()
-	}
+	r.ctx, r.cancel = context.WithTimeout(context.Background(), 15*time.Second)
 }
 
 // Stop will cancel the monitoring process

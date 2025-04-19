@@ -7,8 +7,6 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/mem"
 )
 
 type MySQLChecker struct {
@@ -30,6 +28,16 @@ type MySQLConfig struct {
 	Heartbeat        time.Duration
 	Ctx              context.Context
 	MonitorResources bool // Flag for resource monitoring
+}
+
+type MySQLStats struct {
+	Connections       int
+	ActiveConnections int
+	Questions         int64
+	SlowQueries       int64
+	Uptime            int64
+	ThreadsRunning    int
+	ThreadsConnected  int
 }
 
 func NewMySQLChecker(cfg MySQLConfig) (*MySQLChecker, error) {
@@ -145,20 +153,79 @@ func (m *MySQLChecker) checkMySQLResourceUsage() (string, error) {
 		return "", nil
 	}
 
-	cpuUsage, err := cpu.Percent(0, false)
+	// Get MySQL stats
+	stats, err := m.getMySQLStats()
 	if err != nil {
-		return "", fmt.Errorf("error getting CPU usage: %v", err)
+		return "", fmt.Errorf("error getting MySQL stats: %v", err)
 	}
 
-	memUsage, err := mem.VirtualMemory()
-	if err != nil {
-		return "", fmt.Errorf("error getting memory usage: %v", err)
+	// Format stats as a string
+	statsInfo := fmt.Sprintf("MySQL Stats: Connections: %d, Active: %d, Threads Running: %d, "+
+		"Threads Connected: %d, Questions: %d, Slow Queries: %d, Uptime: %d seconds",
+		stats.Connections, stats.ActiveConnections, stats.ThreadsRunning,
+		stats.ThreadsConnected, stats.Questions, stats.SlowQueries, stats.Uptime)
+
+	return statsInfo, nil
+}
+
+// getMySQLStats fetches statistics from MySQL server
+func (m *MySQLChecker) getMySQLStats() (MySQLStats, error) {
+	var stats MySQLStats
+
+	// Check context before executing query
+	if m.ctx.Err() != nil {
+		return stats, m.ctx.Err()
 	}
 
-	resourceInfo := fmt.Sprintf("CPU Usage: %.2f%%, Memory Usage: %.2f%%, Total Memory: %.2f GB",
-		cpuUsage[0], memUsage.UsedPercent, float64(memUsage.Total)/1024/1024/1024)
+	// Query for global status variables
+	rows, err := m.db.QueryContext(m.ctx, "SHOW GLOBAL STATUS")
+	if err != nil {
+		return stats, err
+	}
+	defer rows.Close()
 
-	return resourceInfo, nil
+	// Process results
+	var name, value string
+	statusMap := make(map[string]string)
+	for rows.Next() {
+		if err := rows.Scan(&name, &value); err != nil {
+			return stats, err
+		}
+		statusMap[name] = value
+	}
+
+	// Check for errors from iterating over rows
+	if err := rows.Err(); err != nil {
+		return stats, err
+	}
+
+	// Get connection information
+	var maxConnections int
+	err = m.db.QueryRowContext(m.ctx, "SHOW VARIABLES LIKE 'max_connections'").Scan(&name, &value)
+	if err == nil {
+		fmt.Sscanf(value, "%d", &maxConnections)
+		stats.Connections = maxConnections
+	}
+
+	// Parse values from status map
+	if v, ok := statusMap["Threads_connected"]; ok {
+		fmt.Sscanf(v, "%d", &stats.ThreadsConnected)
+		stats.ActiveConnections = stats.ThreadsConnected
+	}
+	if v, ok := statusMap["Threads_running"]; ok {
+		fmt.Sscanf(v, "%d", &stats.ThreadsRunning)
+	}
+	if v, ok := statusMap["Questions"]; ok {
+		fmt.Sscanf(v, "%d", &stats.Questions)
+	}
+	if v, ok := statusMap["Slow_queries"]; ok {
+		fmt.Sscanf(v, "%d", &stats.SlowQueries)
+	}
+	if v, ok := statusMap["Uptime"]; ok {
+		fmt.Sscanf(v, "%d", &stats.Uptime)
+	}
+
+	return stats, nil
 }
 
 func (m *MySQLChecker) GetDB() *sql.DB {
@@ -183,9 +250,13 @@ func (m *MySQLChecker) StartMonitoring() {
 			case <-m.ctx.Done():
 				// Reset context if canceled or expired
 				m.resetContext()
-				// Restart the ticker for the new context
-				ticker = time.NewTicker(m.heartbeat)
+				// Continue with the next check
 			case <-ticker.C:
+				// Check if context is expired before using it
+				if m.ctx.Err() != nil {
+					m.resetContext()
+				}
+
 				status, detail := m.Check()
 				fmt.Printf("[MySQL] Status: %v, Detail: %v\n", status, detail)
 				if m.monitorResources {
@@ -203,30 +274,13 @@ func (m *MySQLChecker) StartMonitoring() {
 
 // Reset the context when it's canceled or expired
 func (m *MySQLChecker) resetContext() {
-	// Cancel the current context
+	// Cancel the current context if it exists
 	if m.cancel != nil {
 		m.cancel()
 	}
 
-	// Create a new context with the same timeout or custom duration
-	var baseCtx context.Context
-	var baseCancel context.CancelFunc
-
-	if m.ctx == nil {
-		baseCtx, baseCancel = context.WithTimeout(context.Background(), 15*time.Second)
-	} else {
-		baseCtx = m.ctx
-	}
-
-	m.ctx, m.cancel = context.WithCancel(baseCtx)
-
-	// Clean up the base context after setting up (so timeout doesn't run forever)
-	if baseCancel != nil {
-		go func() {
-			<-m.ctx.Done()
-			baseCancel()
-		}()
-	}
+	// Always create a fresh context from background
+	m.ctx, m.cancel = context.WithTimeout(context.Background(), 15*time.Second)
 }
 
 // Stop will cancel the monitoring process
