@@ -179,7 +179,10 @@ func (r *RedisChecker) StartMonitoring() {
 		for {
 			select {
 			case <-r.ctx.Done():
-				return
+				// Reset the context if it’s canceled or expired
+				r.resetContext()
+				// Restart the ticker for the new context
+				ticker = time.NewTicker(r.heartbeat)
 			case <-ticker.C:
 				status, detail := r.Check()
 				fmt.Printf("[Redis] Status: %v, Detail: %v\n", status, detail)
@@ -193,6 +196,34 @@ func (r *RedisChecker) StartMonitoring() {
 				}
 			}
 		}
+	}
+}
+
+// Reset the context when it's canceled or expired
+func (r *RedisChecker) resetContext() {
+	// Cancel the current context
+	if r.cancel != nil {
+		r.cancel()
+	}
+
+	// Create a new context with a timeout or custom duration
+	var baseCtx context.Context
+	var baseCancel context.CancelFunc
+
+	if r.ctx == nil {
+		baseCtx, baseCancel = context.WithTimeout(context.Background(), 15*time.Second)
+	} else {
+		baseCtx = r.ctx
+	}
+
+	r.ctx, r.cancel = context.WithCancel(baseCtx)
+
+	// Clean up the base context after setting up (so timeout doesn't run forever)
+	if baseCancel != nil {
+		go func() {
+			<-r.ctx.Done()
+			baseCancel()
+		}()
 	}
 }
 
