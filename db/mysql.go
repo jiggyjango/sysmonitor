@@ -181,7 +181,10 @@ func (m *MySQLChecker) StartMonitoring() {
 		for {
 			select {
 			case <-m.ctx.Done():
-				return
+				// Reset context if canceled or expired
+				m.resetContext()
+				// Restart the ticker for the new context
+				ticker = time.NewTicker(m.heartbeat)
 			case <-ticker.C:
 				status, detail := m.Check()
 				fmt.Printf("[MySQL] Status: %v, Detail: %v\n", status, detail)
@@ -195,6 +198,34 @@ func (m *MySQLChecker) StartMonitoring() {
 				}
 			}
 		}
+	}
+}
+
+// Reset the context when it's canceled or expired
+func (m *MySQLChecker) resetContext() {
+	// Cancel the current context
+	if m.cancel != nil {
+		m.cancel()
+	}
+
+	// Create a new context with the same timeout or custom duration
+	var baseCtx context.Context
+	var baseCancel context.CancelFunc
+
+	if m.ctx == nil {
+		baseCtx, baseCancel = context.WithTimeout(context.Background(), 15*time.Second)
+	} else {
+		baseCtx = m.ctx
+	}
+
+	m.ctx, m.cancel = context.WithCancel(baseCtx)
+
+	// Clean up the base context after setting up (so timeout doesn't run forever)
+	if baseCancel != nil {
+		go func() {
+			<-m.ctx.Done()
+			baseCancel()
+		}()
 	}
 }
 
